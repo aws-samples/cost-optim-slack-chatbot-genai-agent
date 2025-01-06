@@ -67,7 +67,7 @@ Use as an input:
 ## Deploy OpenSearch Serverless with CloudFormation
 
 Get the code on your dev environment: 
->git clone git@ssh.gitlab.aws.dev:merichea/CostOptimChatbot.git
+>git clone https://github.com/aws-samples/cost-optim-slack-chatbot-genai-agent.git
 
 Install the [SAM CLI](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html) and [python12](https://www.python.org/downloads/release/python-3128/) if needed.
 
