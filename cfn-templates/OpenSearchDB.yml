@@ -1,0 +1,176 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Create an Vector OpenSearch Serverless DB for the Bedrock Knowledge Base
+Parameters:
+
+  IAMUserArn: 
+    Description: The Arn of the IAM user (or assumed role) running this CloudFormation template.
+    Type: String
+
+Mappings:
+  RegionMap:
+    us-east-1:
+      PandasLayer: 'arn:aws:lambda:us-east-1:336392948345:layer:AWSSDKPandas-Python312:12'
+    us-east-2:
+      PandasLayer: 'arn:aws:lambda:us-east-2:336392948345:layer:AWSSDKPandas-Python312:12'
+    us-west-1:
+      PandasLayer: 'arn:aws:lambda:us-west-1:336392948345:layer:AWSSDKPandas-Python312:12'
+    us-west-2:
+      PandasLayer: 'arn:aws:lambda:us-west-2:336392948345:layer:AWSSDKPandas-Python312:12'
+
+Resources:
+   
+  DataAccessPolicy:
+    Type: 'AWS::OpenSearchServerless::AccessPolicy'
+    Properties:
+      Name: !Join
+      - '-'
+      - - aosscollection
+        - access-policy
+      Type: data
+      Description: Access policy for AOSS collection
+      Policy: !Sub >-
+        [{"Description":"Access for cfn user","Rules":[{"ResourceType":"index","Resource":["index/*/*"],"Permission":["aoss:*"]},
+        {"ResourceType":"collection","Resource":["collection/*"],"Permission":["aoss:*"]}],
+        "Principal":["${IAMUserArn}", "${AmazonBedrockExecutionRoleForKnowledgeBase.Arn}", "${OpenSearchIndexLambdaRole.Arn}"]}]
+    DeletionPolicy: Delete
+
+  NetworkPolicy:
+    Type: 'AWS::OpenSearchServerless::SecurityPolicy'
+    Properties:
+      Name: !Join
+      - '-'
+      - - aosscollection
+        - network-policy
+      Type: network
+      Description: Network policy for AOSS collection
+      Policy: !Sub >-
+        [{"Rules":[{"ResourceType":"collection","Resource":["collection/aosscollection"]}, {"ResourceType":"dashboard","Resource":["collection/aosscollection"]}],"AllowFromPublic":true}]
+    DeletionPolicy: Delete
+
+  EncryptionPolicy:
+    Type: 'AWS::OpenSearchServerless::SecurityPolicy'
+    Properties:
+      Name: !Join
+      - '-'
+      - - aosscollection
+        - security-policy
+      Type: encryption
+      Description: Encryption policy for AOSS collection
+      Policy: !Sub >-
+        {"Rules":[{"ResourceType":"collection","Resource":["collection/aosscollection"]}],"AWSOwnedKey":true}
+    DeletionPolicy: Delete
+
+  CostOptimCollection:
+    Type: 'AWS::OpenSearchServerless::Collection'
+    Properties:
+      Name: aosscollection
+      Type: VECTORSEARCH
+      Description: Collection to holds vector search data
+    DependsOn: 
+      - EncryptionPolicy
+      - NetworkPolicy
+    DeletionPolicy: Delete
+
+  AmazonBedrockExecutionRoleForKnowledgeBase:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: bedrock.amazonaws.com
+          Action: sts:AssumeRole
+          Condition:
+            StringEquals:
+              "aws:SourceAccount": !Sub "${AWS::AccountId}"
+            ArnLike:
+              "AWS:SourceArn": !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/*"
+      Path: /
+      ManagedPolicyArns:
+        - !Ref BedrockExecRoleForKBCustomPolicy
+    DeletionPolicy: Delete
+
+  BedrockExecRoleForKBCustomPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - aoss:APIAccessAll
+              - bedrock:InvokeModel
+              - bedrock:ListCustomModels
+            Resource:
+              - !Sub arn:aws:aoss:${AWS::Region}:${AWS::AccountId}:collection/*
+              - !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/*
+    DeletionPolicy: Delete
+
+  OpenSearchIndexLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref OpenSearchIndexLambdaCustomPolicy
+    DeletionPolicy: Delete
+
+  OpenSearchIndexLambdaCustomPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              - aoss:APIAccessAll
+            Resource:
+              - !Sub arn:aws:aoss:${AWS::Region}:${AWS::AccountId}:collection/*
+              - !Sub arn:aws:aoss:${AWS::Region}:${AWS::AccountId}:index/*
+              - !Sub arn:aws:aoss:${AWS::Region}:${AWS::AccountId}:index/*/*
+              - !Sub arn:aws:aoss:${AWS::Region}:${AWS::AccountId}:index/aosscollection/*
+              - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:*
+    DeletionPolicy: Delete
+
+  OpenSearchIndexLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: OpenSearchIndexLambda
+      Description: Lambda to create OpenSearch index
+      Handler: OpenSearchIndexLambda.handler
+      Role: !GetAtt OpenSearchIndexLambdaRole.Arn
+      CodeUri: .\src\OpenSearchIndexLambda.py
+      Runtime: python3.12
+      Timeout: 900
+      Layers: 
+        - !FindInMap [RegionMap, !Ref 'AWS::Region', PandasLayer]
+    DeletionPolicy: Delete
+
+  CreateOpenSearchIndex:
+    Type: Custom::CreateOpenSearchIndex
+    Properties:
+      ServiceToken: !GetAtt OpenSearchIndexLambda.Arn
+      CollectionName: CostOptimCollection
+      IndexName: aossindex
+      CollectionId: !GetAtt CostOptimCollection.Id
+      Region: !Ref 'AWS::Region'
+    DeletionPolicy: Delete
+
+Outputs:
+
+  AmazonBedrockExecutionRoleForKnowledgeBase:
+    Value: !GetAtt AmazonBedrockExecutionRoleForKnowledgeBase.Arn
+    Description: ARN of the Bedrock execution role
+
+  CollectionARN:
+    Value: !GetAtt CostOptimCollection.Arn
+    Description: ARN of the OpenSearch Serverless Collection

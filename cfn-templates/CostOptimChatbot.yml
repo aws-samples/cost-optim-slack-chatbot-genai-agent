@@ -1,0 +1,482 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Create an API Gateway and a CostOptimBot Lambda function
+
+Parameters:
+  ApiGwStageName:
+    Type: String
+    Default: dev
+  ApiGwPathPart:
+    Type: String
+    Default: api
+  Region:
+    Type: String
+    Description: AWS region
+  AmazonBedrockExecutionRoleForKnowledgeBaseArn:
+    Type: String
+    Description: Execution Role for Knowledge Base Arn.
+  CollectionArn:
+    Type: String
+    Description: Collection Arn from the previous stack.
+
+Resources:
+
+  KMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS key for CloudWatch log group encryption
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Id: key-default-1
+        Statement:
+          - Sid: Allow LogGroups to use the KMS key
+            Effect: Allow
+            Principal:
+              Service: logs.amazonaws.com
+            Action:
+              - kms:Encrypt*
+              - kms:Decrypt*
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:Describe*
+            Resource: '*'
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+    UpdateReplacePolicy: Retain
+    DeletionPolicy: Delete
+
+
+  Events:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: eventid
+          AttributeType: S
+      KeySchema:
+        - AttributeName: eventid
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      Tags:
+        - Key: auto-delete
+          Value: no
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: alias/aws/dynamodb
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+    UpdateReplacePolicy: Retain
+    DeletionPolicy: Delete
+
+
+  CostOptimBotLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/CostOptimBotFunction
+      RetentionInDays: 7
+      KmsKeyId: !GetAtt KMSKey.Arn
+    UpdateReplacePolicy: Retain
+    DeletionPolicy: Delete
+
+  CostOptimBotFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: CostOptimBotFunction
+      Runtime: python3.12
+      Timeout: 900
+      CodeUri: ./src/CostOptimBotFunction.py
+      Handler: CostOptimBotFunction.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          token: '{{resolve:secretsmanager:SlackToken:SecretString:token}}'
+          BedrockAgentId: !Ref Agent
+          BedrockAliasId: !GetAtt AgentAlias.AgentAliasId
+          Region: !Ref Region
+          TableName: !Ref Events
+      KmsKeyArn: !GetAtt KMSKey.Arn
+    DeletionPolicy: Delete
+
+  AWSLambdaDynamoDBBedrockCustomPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - dynamodb:DescribeTable
+              - dynamodb:GetItem
+              - dynamodb:PutItem
+              - bedrock:InvokeAgent
+            Resource:
+              - !GetAtt Events.Arn
+              - !Sub 'arn:aws:bedrock:${Region}:${AWS::AccountId}:agent/*'
+              - !Sub 'arn:aws:bedrock:${Region}:${AWS::AccountId}:agent-alias/*'
+    DeletionPolicy: Delete
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !Ref AWSLambdaDynamoDBBedrockCustomPolicy
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaRole
+    DeletionPolicy: Delete
+
+  AmazonBedrockAgentCustomPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - lambda:InvokeFunction
+              - bedrock:InvokeAgent
+              - bedrock:InvokeModel
+              - bedrock:Retrieve
+            Resource:
+              - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:*'
+              - !Sub 'arn:aws:bedrock:${AWS::Region}::agent/*'
+              - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/*'
+              - !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/*'
+    DeletionPolicy: Delete
+
+
+  BedrockExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - bedrock.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref AmazonBedrockAgentCustomPolicy
+    DeletionPolicy: Delete
+
+  ApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: CostOptimBotApiGateway
+      Description: Cost Optim Bot API Gateway
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+    DeletionPolicy: Delete
+
+  ApiGatewayResourceRoot:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: !Ref ApiGwPathPart
+      RestApiId: !Ref ApiGateway
+    DeletionPolicy: Delete
+
+  ApiGatewayMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      HttpMethod: POST
+      ResourceId: !Ref ApiGatewayResourceRoot
+      RestApiId: !Ref ApiGateway
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref CustomAuthorizer
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${CostOptimBotFunction.Arn}/invocations
+    DeletionPolicy: Delete
+
+
+  ApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ApiGatewayMethod
+      - ApiGatewayRole
+    Properties:
+      RestApiId: !Ref ApiGateway
+    DeletionPolicy: Delete
+
+  ApiGwAccount:
+    Type: 'AWS::ApiGateway::Account'
+    Properties:
+      CloudWatchRoleArn: !GetAtt ApiGatewayRole.Arn
+
+  ApiGatewayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub 'API-Gateway-Access-Logs-${ApiGateway}'
+      RetentionInDays: 7
+      KmsKeyId: !GetAtt KMSKey.Arn
+    UpdateReplacePolicy: Retain
+    DeletionPolicy: Delete
+
+  ApiGatewayStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      StageName: !Ref ApiGwStageName
+      RestApiId: !Ref ApiGateway
+      DeploymentId: !Ref ApiGatewayDeployment
+      AccessLogSetting:
+        DestinationArn: !GetAtt ApiGatewayLogGroup.Arn
+        Format: >-
+          { "requestId":"$context.requestId", 
+          "ip": "$context.identity.sourceIp",
+          "caller":"$context.identity.caller",
+          "user":"$context.identity.user",
+          "requestTime":"$context.requestTime",
+          "httpMethod":"$context.httpMethod",
+          "resourcePath":"$context.resourcePath",
+          "status":"$context.status",
+          "protocol":"$context.protocol",
+          "responseLength":"$context.responseLength",
+          "validationError":"$context.identity.errorMessage",
+          "userAgent":"$context.identity.userAgent",
+          "stage":"$context.stage" }
+    DeletionPolicy: Delete
+
+  CustomAuthorizerFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/CustomAuthorizerFunction
+      RetentionInDays: 7
+      KmsKeyId: !GetAtt KMSKey.Arn
+    UpdateReplacePolicy: Retain
+    DeletionPolicy: Delete
+
+  CustomAuthorizerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: CustomAuthorizerFunction
+      Runtime: python3.12
+      Timeout: 900
+      CodeUri: ./src/CustomAuthorizerFunction.py
+      Handler: CustomAuthorizerFunction.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+    DeletionPolicy: Delete
+
+
+  CustomAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      Name: CustomAuthorizer
+      RestApiId: !Ref ApiGateway
+      Type: REQUEST
+      AuthorizerUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${CustomAuthorizerFunction.Arn}/invocations
+      AuthorizerResultTtlInSeconds: 300
+      IdentitySource: method.request.header.x-slack-signature
+      IdentityValidationExpression: '.*'
+      AuthorizerCredentials: !GetAtt ApiGatewayRole.Arn
+
+  ApiGatewayRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - !Ref ApiGwCustomPolicy
+        - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+    DeletionPolicy: Delete
+
+  ApiGwCustomPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - execute-api:Invoke
+              - lambda:InvokeFunction
+            Resource: 
+              - !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/*'
+              - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${CostOptimBotFunction}'
+              - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${CustomAuthorizerFunction}'
+              - !GetAtt KMSKey.Arn
+    DeletionPolicy: Delete
+
+  LambdaPermissionApiGW:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CostOptimBotFunction
+      Principal: apigateway.amazonaws.com
+      Action: lambda:InvokeFunction
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/*'
+    DeletionPolicy: Delete
+
+
+  LambdaInvokePermissionForAgent:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !GetAtt CostOptimLambda.Arn
+      Action: 'lambda:InvokeFunction'
+      Principal: 'bedrock.amazonaws.com'
+      SourceArn: !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:agent/*'
+
+  LambdaBotExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+    DeletionPolicy: Delete
+
+  Agent:
+    Type: AWS::Bedrock::Agent
+    Properties:
+      AgentName: CostOptimAgent
+      FoundationModel: anthropic.claude-3-sonnet-20240229-v1:0
+      AgentResourceRoleArn: !GetAtt BedrockExecutionRole.Arn
+      ActionGroups:
+        - ActionGroupName: GetURL-Action-Group
+          Description: Action Group to get the QS Dashboard URL
+          ActionGroupExecutor:
+            Lambda: !GetAtt CostOptimLambda.Arn
+          ApiSchema:
+            Payload: |
+              {
+                  "openapi": "3.0.0",
+                  "info": {
+                      "title": "Cost Optim QuickSight Dashboard",
+                      "version": "1.0.0",
+                      "description": "Cost Optim QuickSight Dashboard"
+                  },
+                  "paths": {
+                      "/": {
+                          "get": {
+                              "summary": "Get QuickSight dashboard embed URL",
+                              "description": "QuickSight Dashboard",
+                              "operationId": "getDashboardEmbedUrl",
+                              "responses": {
+                                "200": {
+                                  "description": "Successful response",
+                                  "content": {
+                                    "application/json": {
+                                      "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                          "url": {
+                                            "type": "string"
+                                          }
+                                        }
+                                      }
+                                    }
+                                  }
+                                }
+                              }
+                          }
+                      }
+                  }
+                }
+      Instruction: "If the question is about cost, or cost optimization, provide a clear answer and launch the CostOptimLambda lambda function, then display the url that is returned that we can click on directly from the chat"
+      Description: "Agent that will return an answer to Cost Optim questions and a link to QS Cost Optim Dashboard"
+      IdleSessionTTLInSeconds: 900
+      KnowledgeBases:
+          - KnowledgeBaseId: !Ref CostOptimKnowledgeBase
+            Description: Answer based on the data in the Knowledge Base in the Vector OpenSearch DB from the web crawler
+            KnowledgeBaseState: ENABLED
+    DeletionPolicy: Delete
+
+  AgentAlias:
+    Type: AWS::Bedrock::AgentAlias
+    Properties:
+      AgentAliasName: CostOptimAgentAlias
+      AgentId: !Ref Agent
+    DeletionPolicy: Delete
+
+  CostOptimKnowledgeBase:
+    Type: AWS::Bedrock::KnowledgeBase
+    Properties:
+      Name: CostOptimKnowledgeBase
+      Description: Answer based on the data in the Knowledge Base in the Vector OpenSearch DB from the web crawler
+      RoleArn: !Ref AmazonBedrockExecutionRoleForKnowledgeBaseArn
+      KnowledgeBaseConfiguration:
+        Type: "VECTOR"
+        VectorKnowledgeBaseConfiguration:
+          EmbeddingModelArn: !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v2:0"
+      StorageConfiguration:
+        Type: "OPENSEARCH_SERVERLESS"
+        OpensearchServerlessConfiguration:
+          CollectionArn: !Ref CollectionArn
+          VectorIndexName: "aossindex"
+          FieldMapping:
+            VectorField: "vector"
+            TextField: "text"
+            MetadataField: "metadata"
+    DeletionPolicy: Delete
+
+  WebCrawlerDataSource:
+    Type: AWS::Bedrock::DataSource
+    Properties:
+      KnowledgeBaseId: !Ref CostOptimKnowledgeBase
+      Name: WebCrawlerDataSource
+      DataSourceConfiguration:
+        Type: "WEB"
+        WebConfiguration:
+          CrawlerConfiguration:
+            CrawlerLimits:
+                RateLimit: 300
+            Scope: "SUBDOMAINS"
+          SourceConfiguration:
+              UrlConfiguration:
+                  SeedUrls:
+                    - Url: "https://catalog.workshops.aws/awscff/en-US"
+    DeletionPolicy: Delete
+
+  CostOptimLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/CostOptimLambda
+      RetentionInDays: 7
+      KmsKeyId: !GetAtt KMSKey.Arn
+    UpdateReplacePolicy: Retain
+    DeletionPolicy: Delete
+
+  CostOptimLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: CostOptimLambda
+      Runtime: python3.12
+      Timeout: 900
+      CodeUri: ./src/CostOptimLambda.py
+      Handler: CostOptimLambda.lambda_handler
+      Role: !GetAtt LambdaBotExecutionRole.Arn
+    DeletionPolicy: Delete
+
+Outputs:
+
+  ApiUrl:
+    Description: URL of the API Gateway
+    Value: !Sub https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${ApiGwStageName}/${ApiGwPathPart}
