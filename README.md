@@ -37,7 +37,7 @@ You also need to install [Cudos v5](https://catalog.workshops.aws/awscid/en-US/d
 
 <img src="img/Create-Slack-App-3.png" width="75%" alt="Create-Slack-App-3">
 
-Adapt and use this [manifest](https://github.com/aws-samples/slack-app-integration-with-bedrock-agent/blob/main/slack-app/manifest.yml)
+Adapt and use this [manifest](slack-integration/manifest.yml)
 
 ![Create-Slack-App-4](img/Create-Slack-App-4.png)
 
