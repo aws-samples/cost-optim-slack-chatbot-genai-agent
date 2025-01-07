@@ -1,9 +1,0 @@
-version = 0.1
-[default.deploy.parameters]
-stack_name = "COC"
-resolve_s3 = true
-s3_prefix = "COC"
-region = "us-east-1"
-capabilities = "CAPABILITY_NAMED_IAM"
-parameter_overrides = "ApiGwStageName=\"dev\" ApiGwPathPart=\"api\" Region=\"us-east-1\" AmazonBedrockExecutionRoleForKnowledgeBaseArn=\"arn:aws:iam::058264347283:role/AOSS-AmazonBedrockExecutionRoleForKnowledgeBase-51V027dEBLkt\" CollectionArn=\"arn:aws:aoss:us-east-1:058264347283:collection/tzpuf3vcsbpvlhk0qos2\""
-image_repositories = []
